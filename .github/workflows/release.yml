@@ -1,0 +1,99 @@
+name: Stable Release (Linux)
+
+on:
+  schedule:
+    - cron: '15 0 * * *'  # 00:15 UTC daily — checks for new upstream releases
+  workflow_dispatch:
+
+jobs:
+  check-upstream-release:
+    name: Check for new upstream release
+    runs-on: ubuntu-latest
+    outputs:
+      has_new_release: ${{ steps.compare.outputs.has_new_release }}
+      upstream_tag: ${{ steps.compare.outputs.upstream_tag }}
+      upstream_version: ${{ steps.compare.outputs.upstream_version }}
+
+    steps:
+      - name: Fetch latest upstream release tag
+        id: compare
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          UPSTREAM_TAG=$(gh release view --repo MadMax1960/LivingTheDreamToolkit --json tagName -q .tagName 2>/dev/null || echo "")
+
+          if [ -z "$UPSTREAM_TAG" ]; then
+            echo "Could not fetch upstream release."
+            echo "has_new_release=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "upstream_tag=$UPSTREAM_TAG" >> "$GITHUB_OUTPUT"
+          echo "upstream_version=${UPSTREAM_TAG#v}" >> "$GITHUB_OUTPUT"
+
+          # Check if we already have a release with this tag in THIS repo
+          EXISTING=$(gh release view "$UPSTREAM_TAG" --repo ${{ github.repository }} --json tagName -q .tagName 2>/dev/null || echo "")
+
+          if [ "$EXISTING" = "$UPSTREAM_TAG" ]; then
+            echo "Already built $UPSTREAM_TAG. Skipping."
+            echo "has_new_release=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "New upstream release: $UPSTREAM_TAG"
+            echo "has_new_release=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    name: Build & Publish (linux-x64)
+    needs: check-upstream-release
+    if: needs.check-upstream-release.outputs.has_new_release == 'true'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout THIS repo
+        uses: actions/checkout@v4
+
+      - name: Checkout upstream at release tag
+        uses: actions/checkout@v4
+        with:
+          repository: MadMax1960/LivingTheDreamToolkit
+          ref: ${{ needs.check-upstream-release.outputs.upstream_tag }}
+          path: source
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '9.0.x'
+
+      - name: Restore dependencies
+        run: dotnet restore source/LivinTheDreamToolkit.sln
+
+      - name: Publish GUI (self-contained, linux-x64)
+        run: |
+          dotnet publish source/LivinTheDreamToolkit.Gui/LivinTheDreamToolkit.Gui.csproj \
+            --configuration Release \
+            --runtime linux-x64 \
+            --self-contained true \
+            -p:PublishSingleFile=true \
+            -p:PublishReadyToRun=true \
+            --output ./publish/linux-x64
+
+      - name: Set executable bit
+        run: chmod +x ./publish/linux-x64/LivinTheDreamToolkit.Gui
+
+      - name: Create release archive
+        run: |
+          TAG="${{ needs.check-upstream-release.outputs.upstream_tag }}"
+          ARCHIVE_NAME="LivinTheDreamToolkit-linux-x64-${TAG}.tar.gz"
+          echo "ARCHIVE_NAME=$ARCHIVE_NAME" >> "$GITHUB_ENV"
+          cd publish && tar -czvf "../$ARCHIVE_NAME" linux-x64/
+
+      - name: Create stable release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ needs.check-upstream-release.outputs.upstream_tag }}"
+          gh release create "$TAG" \
+            --repo ${{ github.repository }} \
+            --title "Linux Build ${TAG}" \
+            --notes "Linux build of upstream release [${TAG}](https://github.com/MadMax1960/LivingTheDreamToolkit/releases/tag/${TAG})." \
+            "${{ env.ARCHIVE_NAME }}"
