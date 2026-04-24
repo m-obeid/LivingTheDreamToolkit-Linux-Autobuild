@@ -1,0 +1,106 @@
+name: Nightly Pre-Release (Linux)
+
+on:
+  schedule:
+    - cron: '0 0 * * *'   # midnight UTC daily
+  workflow_dispatch:       # allow manual trigger too
+
+jobs:
+  check-upstream:
+    name: Check for new upstream commits
+    runs-on: ubuntu-latest
+    outputs:
+      has_changes: ${{ steps.compare.outputs.has_changes }}
+      upstream_sha: ${{ steps.compare.outputs.upstream_sha }}
+
+    steps:
+      - name: Get latest upstream SHA
+        id: compare
+        run: |
+          UPSTREAM_SHA=$(git ls-remote https://github.com/MadMax1960/LivingTheDreamToolkit.git refs/heads/master | cut -f1)
+          echo "upstream_sha=$UPSTREAM_SHA" >> "$GITHUB_OUTPUT"
+
+          # Fetch the SHA we last built (stored as a release tag description or a known file)
+          # We track it via a git tag in THIS repo named 'last-built-sha'
+          LAST_SHA=$(git ls-remote origin refs/tags/last-built-sha | cut -f1)
+
+          if [ "$UPSTREAM_SHA" = "$LAST_SHA" ]; then
+            echo "No new commits upstream. Skipping build."
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "New commits found: $UPSTREAM_SHA"
+            echo "has_changes=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    name: Build & Publish (linux-x64)
+    needs: check-upstream
+    if: needs.check-upstream.outputs.has_changes == 'true'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout THIS repo (for workflow files)
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Checkout upstream source
+        uses: actions/checkout@v4
+        with:
+          repository: MadMax1960/LivingTheDreamToolkit
+          path: source
+          ref: master
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '9.0.x'
+
+      - name: Restore dependencies
+        run: dotnet restore source/LivinTheDreamToolkit.sln
+
+      - name: Publish GUI (self-contained, linux-x64)
+        run: |
+          dotnet publish source/LivinTheDreamToolkit.Gui/LivinTheDreamToolkit.Gui.csproj \
+            --configuration Release \
+            --runtime linux-x64 \
+            --self-contained true \
+            -p:PublishSingleFile=true \
+            -p:PublishReadyToRun=true \
+            --output ./publish/linux-x64
+
+      - name: Set executable bit
+        run: chmod +x ./publish/linux-x64/LivinTheDreamToolkit.Gui
+
+      - name: Create release archive
+        run: |
+          SHORT_SHA=$(echo "${{ needs.check-upstream.outputs.upstream_sha }}" | cut -c1-7)
+          ARCHIVE_NAME="LivinTheDreamToolkit-linux-x64-nightly-${SHORT_SHA}.tar.gz"
+          echo "ARCHIVE_NAME=$ARCHIVE_NAME" >> "$GITHUB_ENV"
+          cd publish && tar -czvf "../$ARCHIVE_NAME" linux-x64/
+
+      - name: Delete previous nightly pre-release (if exists)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release delete nightly --repo ${{ github.repository }} --yes || true
+          git push origin :refs/tags/nightly || true
+
+      - name: Create nightly pre-release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          SHORT_SHA=$(echo "${{ needs.check-upstream.outputs.upstream_sha }}" | cut -c1-7)
+          gh release create nightly \
+            --repo ${{ github.repository }} \
+            --title "Nightly (${SHORT_SHA})" \
+            --notes "Automated nightly build from upstream commit [\`${SHORT_SHA}\`](https://github.com/MadMax1960/LivingTheDreamToolkit/commit/${{ needs.check-upstream.outputs.upstream_sha }})." \
+            --prerelease \
+            "${{ env.ARCHIVE_NAME }}"
+
+      - name: Update last-built-sha tag
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -f last-built-sha ${{ needs.check-upstream.outputs.upstream_sha }}
+          git push origin refs/tags/last-built-sha --force
